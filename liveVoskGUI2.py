@@ -12,7 +12,7 @@ import difflib
 class SpeechRecognitionApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Speech Recognition - Final Results Only")
+        self.root.title("Speech Recognition - Real-time Updates")
         self.root.geometry("1000x600")
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -22,16 +22,18 @@ class SpeechRecognitionApp:
         # Setup Vosk
         try:
             self.model = Model(r"C:\Users\DELL\PycharmProjects\ASR\vosk-model-small-en-us-0.15")
+            # Use larger buffer size and enable words with timestamps
             self.recognizer = KaldiRecognizer(self.model, 16000)
+            self.recognizer.SetWords(True)  # Enable word timestamps
 
-            # Setup audio stream
+            # Setup audio stream with smaller buffer for more frequent updates
             self.mic = pyaudio.PyAudio()
             self.stream = self.mic.open(
                 format=pyaudio.paInt16,
                 channels=1,
                 rate=16000,
                 input=True,
-                frames_per_buffer=8192
+                frames_per_buffer=1024  # Smaller buffer for even more frequent processing
             )
             self.stream.start_stream()
             self.setup_successful = True
@@ -111,11 +113,46 @@ class SpeechRecognitionApp:
         )
         self.toggle_button.pack(side=tk.LEFT, padx=10)
 
+        # Control for update behavior
+        self.control_frame = tk.Frame(self.button_frame)
+        self.control_frame.pack(side=tk.LEFT, padx=10)
+
+        # Update interval control
+        self.interval_frame = tk.Frame(self.control_frame)
+        self.interval_frame.pack(side=tk.TOP, padx=5, pady=2)
+
+        tk.Label(self.interval_frame, text="Update Interval:").pack(side=tk.LEFT)
+
+        self.interval_var = tk.StringVar(value="0.5")  # Default to faster updates
+        interval_options = ["0.1", "0.3", "0.5", "1.0", "2.0"]
+        self.interval_dropdown = tk.OptionMenu(self.interval_frame, self.interval_var, *interval_options)
+        self.interval_dropdown.pack(side=tk.LEFT, padx=5)
+
+        tk.Label(self.interval_frame, text="seconds").pack(side=tk.LEFT)
+
+        # Real-time mode toggle
+        self.real_time_frame = tk.Frame(self.control_frame)
+        self.real_time_frame.pack(side=tk.TOP, padx=5, pady=2)
+
+        self.real_time_var = tk.BooleanVar(value=True)
+        self.real_time_check = tk.Checkbutton(
+            self.real_time_frame,
+            text="Real-time Updates",
+            variable=self.real_time_var,
+            onvalue=True,
+            offvalue=False
+        )
+        self.real_time_check.pack(side=tk.LEFT)
+
         # For handling text processing
         self.full_transcript = ""  # The complete transcript text
+        self.current_partial = ""  # Current partial text for real-time display
         self.recent_segments = deque(maxlen=10)  # Store recent text segments for comparison
         self.recognition_active = True
         self.min_similarity_threshold = 0.7  # Threshold for considering text similar
+        self.last_update_time = time.time()
+        self.force_update_timer = 0.5  # Force update more frequently initially
+        self.word_update_threshold = 2  # Update after this many new words (reduced from 5)
 
         if self.setup_successful:
             self.status_label.config(text="Status: Ready")
@@ -128,6 +165,7 @@ class SpeechRecognitionApp:
     def reset_transcript(self):
         """Clear the transcript and reset processing variables"""
         self.full_transcript = ""
+        self.current_partial = ""
         self.recent_segments.clear()
         self.update_mainbox("")
         self.status_label.config(text="Status: Transcript Reset")
@@ -211,6 +249,17 @@ class SpeechRecognitionApp:
             # Use provided text or full transcript
             text_to_display = new_text if new_text is not None else self.full_transcript
 
+            # In real-time mode, append current partial text if available
+            if self.real_time_var.get() and self.current_partial:
+                if text_to_display:
+                    # Add proper punctuation/spacing to connect with partial
+                    if text_to_display[-1] in ".!?":
+                        text_to_display += " " + self.current_partial.capitalize()
+                    else:
+                        text_to_display += ". " + self.current_partial.capitalize()
+                else:
+                    text_to_display = self.current_partial.capitalize()
+
             self.main_box.insert(tk.END, text_to_display)
             self.main_box.see(tk.END)
             self.main_box.config(state=tk.DISABLED)
@@ -235,8 +284,10 @@ class SpeechRecognitionApp:
 
     def listen(self):
         """Main listening function that processes audio and updates transcript"""
-        speaking = False
-        silence_time = 0
+        last_result_time = time.time()
+        accumulated_text = ""
+        last_word_count = 0
+        last_display_update = time.time()
 
         while self.running:
             try:
@@ -244,53 +295,103 @@ class SpeechRecognitionApp:
                     time.sleep(0.1)
                     continue
 
-                data = self.stream.read(4096, exception_on_overflow=False)
+                # Get update interval from UI
+                try:
+                    self.force_update_timer = float(self.interval_var.get())
+                except ValueError:
+                    self.force_update_timer = 0.5
 
+                current_time = time.time()
+                elapsed_since_last_update = current_time - last_result_time
+                elapsed_since_display_update = current_time - last_display_update
+
+                # Get audio data with smaller buffer for more frequent updates
+                data = self.stream.read(512, exception_on_overflow=False)
+
+                # Process the audio data
                 if self.recognizer.AcceptWaveform(data):
-                    # Only process final results
+                    # Got a final result
                     result = json.loads(self.recognizer.Result())
                     final_text = result.get("text", "").strip()
 
                     if final_text:
-                        speaking = True
-                        silence_time = 0
-
-                        # Show in live display briefly
-                        self.update_live_label(f"Final: {final_text}")
-
-                        # Add to transcript if not a duplicate
-                        if self.add_text_to_transcript(final_text):
-                            self.update_mainbox()
-                            self.update_status(f"Status: Added new text")
+                        # Accumulate text
+                        if accumulated_text:
+                            accumulated_text += " " + final_text
                         else:
-                            self.update_status(f"Status: Duplicate text ignored")
+                            accumulated_text = final_text
 
-                        # Reset live display after a short delay
-                        self.root.after(1000, lambda: self.update_live_label("Listening..."))
+                        # Show in live label
+                        self.update_live_label(f"Recognized: {final_text}")
+
+                        # Update transcript if enough time has passed or enough new words
+                        current_word_count = len(accumulated_text.split())
+                        new_words = current_word_count - last_word_count
+
+                        # Lowered the word threshold to 2
+                        if elapsed_since_last_update >= self.force_update_timer or new_words >= self.word_update_threshold:
+                            if self.add_text_to_transcript(accumulated_text):
+                                self.current_partial = ""  # Clear partial text
+                                self.update_mainbox()
+                                self.update_status(f"Status: Updated transcript ({elapsed_since_last_update:.1f}s)")
+
+                            # Reset accumulation
+                            accumulated_text = ""
+                            last_word_count = 0
+                            last_result_time = current_time
+                            last_display_update = current_time
+                        else:
+                            last_word_count = current_word_count
                 else:
-                    # We still process partial results to update the live label
-                    # but we don't add them to the transcript
+                    # Process partial result
                     partial_result = json.loads(self.recognizer.PartialResult())
                     partial_text = partial_result.get("partial", "").strip()
 
                     if partial_text:
-                        speaking = True
-                        silence_time = 0
-                        self.update_live_label(f"Listening: {partial_text}")
-                    else:
-                        # No speech detected
-                        if speaking:
-                            silence_time += 0.1
-                            if silence_time > 1.0:  # After 1 second of silence
-                                speaking = False
-                                self.update_live_label("Listening...")
+                        self.update_live_label(f"Recognizing: {partial_text}")
 
-                time.sleep(0.1)  # Prevent CPU hogging
+                        # Store current partial for real-time display
+                        if self.real_time_var.get():
+                            self.current_partial = partial_text
+
+                            # Update display with partial text more frequently
+                            if elapsed_since_display_update >= 0.2:  # Update display frequently
+                                self.update_mainbox()
+                                last_display_update = current_time
+
+                        # Force update after specified interval regardless of pauses
+                        if elapsed_since_last_update >= self.force_update_timer and accumulated_text:
+                            if self.add_text_to_transcript(accumulated_text):
+                                self.current_partial = partial_text  # Keep current partial
+                                self.update_mainbox()
+                                self.update_status(f"Status: Forced update after {self.force_update_timer}s")
+
+                            # Reset accumulation but keep partial
+                            accumulated_text = ""
+                            last_word_count = 0
+                            last_result_time = current_time
+                    else:
+                        # No speech - if we have accumulated text and it's been a while, add it
+                        if accumulated_text and elapsed_since_last_update >= 0.8:  # Reduced from 1.0
+                            if self.add_text_to_transcript(accumulated_text):
+                                self.current_partial = ""  # Clear partial
+                                self.update_mainbox()
+                                self.update_status("Status: Added text after pause")
+
+                            # Reset accumulation
+                            accumulated_text = ""
+                            last_word_count = 0
+                            last_result_time = current_time
+                            last_display_update = current_time
+                            self.update_live_label("Listening...")
+
+                # Very short sleep to prevent CPU hogging but allow frequent updates
+                time.sleep(0.01)
 
             except Exception as e:
                 print(f"Error in listen thread: {e}")
                 self.update_status(f"Error: {str(e)[:30]}...")
-                time.sleep(1)
+                time.sleep(0.5)
 
     def on_closing(self):
         """Clean up resources when window is closed"""
